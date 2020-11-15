@@ -91,22 +91,27 @@ do_server() ->
     io:get_line("Enter anything to stop server and quit: ").
 
 % websocket callbacks
-init(Req, Status) ->
-    {cowboy_websocket, Req, Status}.
+init(Req, State) ->
+    io:format("~nWS init() State: ~p~n", [State]),
+    {cowboy_websocket, Req, State}.
 
 websocket_init(State) ->
+    io:format("~nWS websocket_init() State: ~p~n", [State]),
     io:format("~nPid: ~p new client~n", [self()]),
     {[], State}.
 
 websocket_handle(Frame, State) ->
+    io:format("~nWS websocket_handle() State: ~p~n", [State]),
     io:format("~nPid: ~p frame: ~p~n", [self(), Frame]),
     {[Frame], State}.
 
 websocket_info(Info, State) ->
+    io:format("~nWS websocket_info() State: ~p~n", [State]),
     io:format("~nPid: ~p info: ~p~n", [self(), Info]),
     {[], State}.
 
-terminate(Reason, PartialReq, _State) ->
+terminate(Reason, PartialReq, State) ->
+    io:format("~nWS terminate() State: ~p~n", [State]),
     io:format(
         "~nPid: ~p terminating: ~p, ~p~n", 
         [self(), Reason, PartialReq]
