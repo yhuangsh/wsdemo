@@ -8,9 +8,7 @@
 -export([websocket_info/2]).
 -export([terminate/3]).
 
-%%====================================================================
-%% API functions
-%%====================================================================
+-export([client_input_loop/1]).
 
 %% escript Entry point
 main(Args) ->
@@ -18,8 +16,6 @@ main(Args) ->
     {ok, Apps1} = application:ensure_all_started(cowboy),
     io:format("Starting dependent apps: ~p~n", [Apps ++ Apps1]),
     case Args of
-        ["client", Server] ->
-            do_client(Server, 80);
         ["client", Server, Port] ->
             do_client(Server, list_to_integer(Port));
         ["server"] ->
@@ -29,6 +25,7 @@ main(Args) ->
             erlang:halt(1)
     end.
 
+% Client
 do_client(Server, Port) ->
     io:format("Connecting to ~p:~p~n", [Server, Port]),
     {ok, Conn} = gun:open(Server, Port, ws_opts()),
@@ -40,7 +37,9 @@ do_client(Server, Port) ->
             io:format("Websocket upgrade successful! "
                       "Conn=~p~n Stream=~p~n Headers=~p~n", 
                       [Conn, Stream, Headers]),
-            do_echo(Conn, Stream);
+            PidClientInputLoop = spawn_link(?MODULE, client_input_loop, 
+                [self()]),
+            client_loop(PidClientInputLoop, Conn, Stream);
         {gun_error, Conn, Stream, Reason} ->
             io:format("Websocket upgrade unsuccessful! "
                       "Conn=~p~n Stream=~p~n Reason=~p~n", 
@@ -57,30 +56,39 @@ do_client(Server, Port) ->
     end,
     erlang:halt(0).
 
-do_echo(Conn, Stream) ->
-    Input = string:trim(io:get_line("Enter a message: "), trailing, "\n"),
-    case Input of
-        "end" ->
+client_loop(PidClientInputLoop, Conn, Stream) ->
+    io:format("client_loop: ~p~n", [self()]),
+    receive
+        {send, "end"} ->
             gun:ws_send(Conn, {close, 1000, "Server existing..."}),
             gun:close(Conn),
-            io:format("Bye!~n"),
+            io:format("client_loop: bye!~n"),
+            exit(PidClientInputLoop, kill),
             erlang:halt(5);
-        Input ->
-            gun:ws_send(Conn, {text, Input}),
-            receive
-                {gun_ws, Conn, Stream, Frame} ->
-                    io:format("Received: ~p~n", [Frame]);
-                Else ->
-                    io:format("!Else: ~p~n", [Else]),
-                    erlang:halt(6)
-            end,
-            do_echo(Conn, Stream)
+        {send, Message} ->
+            gun:ws_send(Conn, {text, Message}),
+            client_loop(PidClientInputLoop, Conn, Stream);
+        {gun_ws, Conn, Stream, Frame} ->
+            io:format("client_loop: received ~p~n", [Frame]),
+            client_loop(PidClientInputLoop, Conn, Stream);
+        Else ->
+            io:format("client_loop: unknown message ~p~n", [Else]),
+            exit(PidClientInputLoop, kill),
+            erlang:halt(6)
     end.
 
+client_input_loop(PidClientLoop) ->
+    io:format("client_input_loop: client_loop pid ~p~n", [PidClientLoop]),
+    Input = string:trim(io:get_line("Enter a message: "), trailing, "\n"),
+    PidClientLoop ! {send, Input},
+    client_input_loop(PidClientLoop).
+
+% Server
 do_server() -> 
+    PidServerLoop = spawn_link(fun server_loop/0),
     Dispatch = cowboy_router:compile(
         [
-            {'_', [{"/", wsdemo, []}]}
+            {'_', [{"/", wsdemo, [PidServerLoop]}]}
         ]
     ),
     {ok, _} = cowboy:start_clear(
@@ -88,34 +96,59 @@ do_server() ->
         [{port, 8080}],
         #{env => #{dispatch => Dispatch}}
     ),
-    io:get_line("Enter anything to stop server and quit: ").
+    server_input_loop(PidServerLoop).
 
-% websocket callbacks
+server_loop() -> server_loop([]).
+server_loop(Conns) -> 
+    receive
+        {send, Text} ->
+            io:format("server_loop: async message to all clients ~p~n",
+                [Conns]),
+            lists:foreach(fun(Conn) -> Conn ! {async_send, Text} end, Conns),
+            server_loop(Conns);
+        {addcon, Conn} ->
+            io:format("server_loop: add connection ~p~n", [Conn]),
+            server_loop([Conn | Conns]);
+        {delcon, Conn} ->
+            io:format("server_loop: del connection ~p~n", [Conn]),
+            server_loop(lists:delete(Conn, Conns))
+    end.
+    
+server_input_loop(PidServerLoop) ->
+    io:format("server_input_loop: enter text to send to all clients, enter"
+        " \"end\" to stop server. "),
+    case string:trim(io:get_line("Enter a message: "), trailing, "\n") of
+        "end" ->
+            ok;
+        Message ->
+            PidServerLoop ! {send, Message},
+            server_input_loop(PidServerLoop)
+    end.
+
+% websocket server callbacks
 init(Req, State) ->
-    io:format("~nWS init() State: ~p~n", [State]),
+    io:format("WS init() State: ~p~n", [State]),
     {cowboy_websocket, Req, State}.
 
-websocket_init(State) ->
-    io:format("~nWS websocket_init() State: ~p~n", [State]),
-    io:format("~nPid: ~p new client~n", [self()]),
+websocket_init([PidServerLoop] = State) ->
+    io:format("WS websocket_init() State: ~p~n", [State]),
+    io:format("Pid: ~p new client~n", [self()]),
+    PidServerLoop ! {addcon, self()},
     {[], State}.
 
 websocket_handle(Frame, State) ->
-    io:format("~nWS websocket_handle() State: ~p~n", [State]),
-    io:format("~nPid: ~p frame: ~p~n", [self(), Frame]),
+    io:format("WS websocket_handle() State: ~p~n", [State]),
+    io:format("Pid: ~p frame: ~p~n", [self(), Frame]),
     {[Frame], State}.
 
-websocket_info(Info, State) ->
-    io:format("~nWS websocket_info() State: ~p~n", [State]),
-    io:format("~nPid: ~p info: ~p~n", [self(), Info]),
-    {[], State}.
+websocket_info({async_send, Text}, State) ->
+    io:format("WS websocket_info() sending async text: ~p~n", [Text]),
+    {[{text, Text}], State}.
 
-terminate(Reason, PartialReq, State) ->
-    io:format("~nWS terminate() State: ~p~n", [State]),
-    io:format(
-        "~nPid: ~p terminating: ~p, ~p~n", 
-        [self(), Reason, PartialReq]
-    ),
+terminate(Reason, PartialReq, [PidServerLoop] = State) ->
+    io:format("WS terminate() State: ~p~n", [State]),
+    io:format("Pid: ~p terminating: ~p, ~p~n", [self(), Reason, PartialReq]),
+    PidServerLoop ! {delcon, self()},
     ok.
 
 %%====================================================================
